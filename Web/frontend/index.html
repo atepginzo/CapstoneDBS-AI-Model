@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EcoSort AI | Smart Waste Detection</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="background-blobs">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+    </div>
+
+    <main class="app-container">
+        <header>
+            <h1 class="logo">Eco<span>Sort</span> AI</h1>
+            <p class="tagline">Intelligent Waste Management System</p>
+        </header>
+
+        <section class="main-interface">
+            <!-- Camera Preview Card -->
+            <div class="card camera-card">
+                <div class="camera-wrapper">
+                    <video id="webcam" autoplay playsinline></video>
+                    <canvas id="overlay"></canvas>
+                    <div class="scan-line"></div>
+                </div>
+                <div class="controls">
+                    <button id="toggleCamera" class="btn btn-primary">Mulai Deteksi Kamera</button>
+                    <p class="hint">Arahkan kamera ke objek sampah (Organik, Anorganik, atau B3)</p>
+                </div>
+            </div>
+
+            <!-- Results Card -->
+            <div class="card result-card">
+                <div class="status-indicator">
+                    <span class="pulse"></span> Status: <span id="status-text">Standby</span>
+                </div>
+
+                <div class="detection-info">
+                    <h3>Hasil Analisis AI</h3>
+                    <div class="result-item">
+                        <label>Kategori Terdeteksi:</label>
+                        <span id="res-category" class="highlight">-</span>
+                    </div>
+                    <div class="result-item">
+                        <label>Tingkat Keyakinan:</label>
+                        <div class="progress-bar">
+                            <div id="res-conf-bar" style="width: 0%"></div>
+                        </div>
+                        <span id="res-conf-text">0%</span>
+                    </div>
+                </div>
+
+                <!-- Tips dari Gemini (auto setelah deteksi) -->
+                <div class="tips-section">
+                    <h4><i class="icon">🌱</i> Panduan Pengolahan:</h4>
+                    <div id="res-tips" class="tips-content">
+                        Tunggu deteksi objek untuk melihat saran pengelolaan sampah yang ramah lingkungan...
+                    </div>
+                </div>
+
+                <!-- Panel Tanya AI (on-demand) -->
+                <div class="ai-ask-section">
+                    <h4>🤖 Tanya AI</h4>
+                    <div class="ai-input-row">
+                        <input
+                            type="text"
+                            id="ai-input"
+                            placeholder="Contoh: Bagaimana cara daur ulang plastik?"
+                        />
+                        <button id="ai-ask-btn" onclick="askGemini()">Tanya</button>
+                    </div>
+                    <div id="ai-answer" class="ai-answer-box">
+                        Ketik pertanyaan lalu klik <strong>Tanya</strong> untuk bertanya ke AI.
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        Powered by EfficientNetB3 &amp; FastAPI &amp; Gemini AI | EcoSort Project 2025
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>
