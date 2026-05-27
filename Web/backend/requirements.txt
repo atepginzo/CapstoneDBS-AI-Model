@@ -5,3 +5,4 @@ tensorflow>=2.15.0
 numpy>=1.26.0
 google-genai>=0.1.0
 python-multipart>=0.0.6
+Pillow>=10.0.0
