@@ -11,6 +11,34 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
 from typing import List
+import pandas as pd
+import hashlib
+
+# ─── KONSTANTA TPS ───
+KEC_COORDS = {
+    "ANDIR": (-6.9178, 107.5867), "ANTAPANI": (-6.9127, 107.6645),
+    "ARCAMANIK": (-6.9000, 107.6800), "ASTANAANYAR": (-6.9400, 107.5967),
+    "BABAKAN CIPARAY": (-6.9450, 107.5800), "BANDUNG KIDUL": (-6.9570, 107.6400),
+    "BANDUNG KULON": (-6.9350, 107.5700), "BATUNUNGGAL": (-6.9250, 107.6320),
+    "BOJONGLOA KIDUL": (-6.9510, 107.5900), "BOJONGLOA KALER": (-6.9380, 107.5830),
+    "BUAHBATU": (-6.9550, 107.6530), "CENANG": (-6.9320, 107.6950),
+    "CIBEUNYING KIDUL": (-6.9022, 107.6356), "CIBEUNYING KALER": (-6.8950, 107.6300),
+    "CIBIRU": (-6.9065, 107.7009), "CICENDO": (-6.9050, 107.5900),
+    "CIDADAP": (-6.8745, 107.5970), "CINAMBO": (-6.9280, 107.7050),
+    "COBLONG": (-6.8950, 107.6100), "GEDEBAGE": (-6.9650, 107.7100),
+    "KIARACONDONG": (-6.9280, 107.6516), "LENGKONG": (-6.9300, 107.6260),
+    "MANDALAJATI": (-6.8930, 107.6900), "PANYILEUKAN": (-6.9560, 107.6950),
+    "RANCASARI": (-6.9550, 107.6780), "REGOL": (-6.9400, 107.6080),
+    "SUKAJADI": (-6.8880, 107.5960), "SUKASARI": (-6.8854, 107.5934),
+    "SUMUR BANDUNG": (-6.9164, 107.6133), "UJUNGBERUNG": (-6.9000, 107.7056),
+}
+KOTA_CENTER = (-6.9175, 107.6191)
+CAPACITY_TON = {"URBAN": 20.0, "SEMI_URBAN": 10.0, "RURAL": 4.0}
+AREA_TYPE_FROM_CSV = {"metropolitan": "URBAN", "semi urban": "SEMI_URBAN", "pedesaan": "RURAL"}
+
+TPS_DATA = {}
+CSV_VOL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sampahbandung_normal_monthly.csv")
+
 
 app = FastAPI(title="EcoSort AI Backend")
 
@@ -178,7 +206,43 @@ class VolumeTimestep(BaseModel):
     volume_ema: float
 
 class PredictVolumeReq(BaseModel):
-    history: List[VolumeTimestep]
+    tps_id: str
+    history: List[VolumeTimestep] = []
+
+# ─── FUNGSI LOAD TPS ───
+def load_tps():
+    global TPS_DATA
+    if not os.path.exists(CSV_VOL_PATH):
+        print(f"[TPS] Peringatan: File CSV tidak ditemukan di {CSV_VOL_PATH}")
+        return
+        
+    df = pd.read_csv(CSV_VOL_PATH)
+    tps_unique = df[['tps_id', 'kecamatan', 'area_type']].drop_duplicates('tps_id').reset_index(drop=True)
+
+    for _, row in tps_unique.iterrows():
+        tps_id = row['tps_id']
+        kec = row['kecamatan']
+        app_type = AREA_TYPE_FROM_CSV.get(row['area_type'], 'RURAL')
+
+        lat0, lon0 = KEC_COORDS.get(kec.upper(), KOTA_CENTER)
+        h = int(hashlib.md5(tps_id.encode()).hexdigest()[:8], 16)
+        lat = round(lat0 + ((h & 0xFF) / 255.0 - 0.5) * 0.018, 6)
+        lon = round(lon0 + ((h >> 8 & 0xFF) / 255.0 - 0.5) * 0.018, 6)
+
+        TPS_DATA[tps_id] = {
+            "id": tps_id,
+            "kecamatan": kec,
+            "alamat": f"{tps_id}, Kec. {kec}, Kota Bandung",
+            "area_type": app_type,
+            "lat": lat,
+            "lon": lon,
+            "kapasitas_ton": CAPACITY_TON[app_type],
+        }
+    print(f"[+] Berhasil load {len(TPS_DATA)} TPS dari CSV.")
+
+@app.on_event("startup")
+async def startup_event():
+    load_tps()
 
 # Routes
 @app.get("/")
@@ -193,13 +257,26 @@ def home():
         "gemini": "ready" if gemini_client else "unavailable",
     }
 
+@app.get("/api/tps")
+def get_all_tps():
+    """Mengembalikan list semua TPS dengan koordinat dan kapasitas."""
+    return list(TPS_DATA.values())
+
 @app.post("/predict-volume/")
 async def predict_volume(req: PredictVolumeReq):
     if model_volume is None or scaler_mean is None or scaler_scale is None:
         return {"status": "error", "message": "Model volume belum ter-load."}
 
-    if len(req.history) != WINDOW_SIZE:
-        return {"status": "error", "message": f"history harus {WINDOW_SIZE} timestep."}
+    if req.tps_id not in TPS_DATA:
+        return {"status": "error", "message": f"TPS {req.tps_id} tidak ditemukan."}
+
+    tps_info = TPS_DATA[req.tps_id]
+
+    if not req.history or len(req.history) != WINDOW_SIZE:
+        return {
+            "status": "error", 
+            "message": f"history harus {WINDOW_SIZE} timestep."
+        }
 
     try:
         raw_rows = [
@@ -224,7 +301,12 @@ async def predict_volume(req: PredictVolumeReq):
             {"bulan_ke": i + 1, "volume_ton": round(float(v), 2)}
             for i, v in enumerate(pred_volume_ton)
         ]
-        return {"status": "success", "predictions": predictions}
+        
+        return {
+            "status": "success", 
+            "tps": tps_info,
+            "predictions": predictions
+        }
 
     except Exception as e:
         import traceback
