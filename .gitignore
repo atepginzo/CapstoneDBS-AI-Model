@@ -48,8 +48,6 @@ Thumbs.db
 # Large Model Files (GitHub file limit is 100MB)
 # model_sampah_CCNN.keras is ~166MB
 *.keras
-!Web/backend/model_sampah_Advanced.keras
-!Web/backend/volume_attention_lstm.keras
 *.h5
 *.pb
 *.pt

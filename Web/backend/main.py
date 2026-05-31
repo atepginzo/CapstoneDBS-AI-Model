@@ -37,7 +37,7 @@ CAPACITY_TON = {"URBAN": 20.0, "SEMI_URBAN": 10.0, "RURAL": 4.0}
 AREA_TYPE_FROM_CSV = {"metropolitan": "URBAN", "semi urban": "SEMI_URBAN", "pedesaan": "RURAL"}
 
 TPS_DATA = {}
-CSV_VOL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sampahbandung_normal_monthly.csv")
+CSV_VOL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sampahbandung_normal_monthly.csv")
 
 
 app = FastAPI(title="EcoSort AI Backend")
@@ -188,6 +188,8 @@ if GEMINI_API_KEY:
 else:
     print("[!] GEMINI_API_KEY tidak ditemukan.")
 
+from datetime import datetime
+
 # Schemas
 class TipsReq(BaseModel):
     kategori: str
@@ -196,20 +198,113 @@ class AskReq(BaseModel):
     pertanyaan: str
     kategori: str = ""
 
-class VolumeTimestep(BaseModel):
-    volume_ton: float
-    sin_month: float
-    cos_month: float
-    area_encoded: float
-    year_norm: float
-    volume_ma: float
-    volume_ema: float
-
 class PredictVolumeReq(BaseModel):
     tps_id: str
-    history: List[VolumeTimestep] = []
 
-# ─── FUNGSI LOAD TPS ───
+# ─── LOGIKA VOLUME & TPS ───
+DF_VOL_AGG = {}
+SEASONAL_FACTOR = {1:1.20,2:1.05,3:1.15,4:1.10,5:1.00,6:0.95,
+                   7:0.88,8:0.88,9:0.92,10:0.98,11:1.05,12:1.25}
+VOL_BASE   = {"URBAN":15.0, "SEMI_URBAN":6.5, "RURAL":2.0}
+AREA_ENC   = {"RURAL":0, "SEMI_URBAN":1, "URBAN":2}
+YR_MIN, YR_MAX = 2017, 2026
+
+def load_vol_csv():
+    global DF_VOL_AGG
+    if not os.path.exists(CSV_VOL_PATH):
+        print(f"[VOL] CSV volume tidak ditemukan: {CSV_VOL_PATH}")
+        return
+    df = pd.read_csv(CSV_VOL_PATH, parse_dates=['tanggal'])
+    df = df.sort_values('tanggal').reset_index(drop=True)
+
+    for csv_type, app_type in AREA_TYPE_FROM_CSV.items():
+        sub = df[df['area_type'] == csv_type].copy()
+        if len(sub) == 0: continue
+        agg = (sub.groupby('tanggal')
+                  .agg(volume_ton=('volume_ton', 'mean'),
+                       area_enc   =('area_enc',   'first'),
+                       bulan      =('bulan',       'first'),
+                       tahun      =('tahun',       'first'))
+                  .reset_index()
+                  .sort_values('tanggal'))
+        agg['month_sin'] = np.sin(2 * np.pi * agg['bulan'] / 12)
+        agg['month_cos'] = np.cos(2 * np.pi * agg['bulan'] / 12)
+        agg['year_norm'] = (agg['tahun'] - YR_MIN) / (YR_MAX - YR_MIN)
+        agg['vol_ma3']   = agg['volume_ton'].rolling(3, min_periods=1).mean()
+        DF_VOL_AGG[app_type] = agg.reset_index(drop=True)
+
+    print(f"[+] Berhasil load data agregat volume ke DF_VOL_AGG")
+
+def _rule_vol(area_type: str, year: int, month: int) -> float:
+    return VOL_BASE[area_type] * (1 + (year - 2019) * 0.035) * SEASONAL_FACTOR[month]
+
+def _get_csv_vol(area_type: str, year: int, month: int):
+    agg = DF_VOL_AGG.get(area_type)
+    if agg is None:
+        return None
+    row = agg[(agg['tahun'] == year) & (agg['bulan'] == month)]
+    return float(row['volume_ton'].values[0]) if len(row) > 0 else None
+
+def _get_window_from_csv(area_type: str, recorded_kg: float = 0.0):
+    FEATURE_COLS = ['volume_ton', 'month_sin', 'month_cos', 'area_enc', 'year_norm', 'vol_ma3']
+    agg = DF_VOL_AGG.get(area_type)
+    if agg is None or len(agg) < WINDOW_SIZE:
+        return None
+    window = agg.tail(WINDOW_SIZE)[FEATURE_COLS].values.copy().astype(np.float32)
+    if recorded_kg > 0:
+        recorded_ton      = recorded_kg / 1000.0
+        window[-1, 0]     = recorded_ton
+        window[-1, 5]     = recorded_ton
+    return window
+
+def predict_volume_lstm(area_type: str, recorded_kg: float = 0.0) -> list:
+    now = datetime.now()
+    base_year, base_month = now.year, now.month
+    LBL = ["Jan","Feb","Mar","Apr","Mei","Jun","Jul","Agu","Sep","Okt","Nov","Des"]
+    timeline = []
+
+    for i in range(3, 0, -1):
+        offset = base_month - i
+        m, y   = (12 + offset, base_year - 1) if offset <= 0 else (offset, base_year)
+        vol    = _get_csv_vol(area_type, y, m) or _rule_vol(area_type, y, m)
+        timeline.append({"bulan": m, "tahun": y, "volume_ton": round(vol, 2), "label": f"{LBL[m-1]} {y}", "type": "history"})
+
+    vol_now = _get_csv_vol(area_type, base_year, base_month) or _rule_vol(area_type, base_year, base_month)
+    if recorded_kg > 0:
+        vol_now = max(vol_now, recorded_kg / 1000.0)
+    timeline.append({"bulan": base_month, "tahun": base_year, "volume_ton": round(vol_now, 2), "label": f"{LBL[base_month-1]} {base_year}", "type": "current"})
+
+    use_lstm = model_volume is not None and scaler_mean is not None and bool(DF_VOL_AGG)
+    if use_lstm:
+        try:
+            X_raw       = _get_window_from_csv(area_type, recorded_kg)
+            if X_raw is None:
+                raise ValueError("window CSV tidak tersedia")
+            X_scaled    = (X_raw - scaler_mean) / scaler_scale
+            X_batch     = np.expand_dims(X_scaled, axis=0).astype(np.float32)
+            pred_scaled = model_volume.predict(X_batch, verbose=0)[0]
+            pred_ton    = pred_scaled * scaler_scale[0] + scaler_mean[0]
+            for i in range(3):
+                offset = base_month + i + 1
+                y = base_year + (offset - 1) // 12
+                m = (offset - 1) % 12 + 1
+                vol = max(0.0, float(pred_ton[i]))
+                timeline.append({"bulan": m, "tahun": y, "volume_ton": round(vol, 2), "label": f"{LBL[m-1]} {y}", "type": "forecast"})
+        except Exception as e:
+            print(f"[LSTM] predict() error: {e} — fallback")
+            use_lstm = False
+            timeline = [p for p in timeline if p["type"] != "forecast"]
+
+    if not use_lstm:
+        for i in range(1, 4):
+            offset = base_month + i
+            y = base_year + (offset - 1) // 12
+            m = (offset - 1) % 12 + 1
+            vol = _rule_vol(area_type, y, m)
+            timeline.append({"bulan": m, "tahun": y, "volume_ton": round(vol, 2), "label": f"{LBL[m-1]} {y}", "type": "forecast"})
+
+    return timeline
+
 def load_tps():
     global TPS_DATA
     if not os.path.exists(CSV_VOL_PATH):
@@ -243,6 +338,7 @@ def load_tps():
 @app.on_event("startup")
 async def startup_event():
     load_tps()
+    load_vol_csv()
 
 # Routes
 @app.get("/")
@@ -264,50 +360,40 @@ def get_all_tps():
 
 @app.post("/predict-volume/")
 async def predict_volume(req: PredictVolumeReq):
-    if model_volume is None or scaler_mean is None or scaler_scale is None:
-        return {"status": "error", "message": "Model volume belum ter-load."}
-
     if req.tps_id not in TPS_DATA:
         return {"status": "error", "message": f"TPS {req.tps_id} tidak ditemukan."}
 
     tps_info = TPS_DATA[req.tps_id]
 
-    if not req.history or len(req.history) != WINDOW_SIZE:
-        return {
-            "status": "error", 
-            "message": f"history harus {WINDOW_SIZE} timestep."
-        }
-
     try:
-        raw_rows = [
-            [
-                ts.volume_ton, ts.sin_month, ts.cos_month,
-                ts.area_encoded, ts.year_norm, ts.volume_ma
-            ]
-            for ts in req.history
-        ]
-        X_raw = np.array(raw_rows, dtype=np.float32)
-        X_scaled = (X_raw - scaler_mean) / scaler_scale
-        X_batch = np.expand_dims(X_scaled, axis=0).astype(np.float32)
-
-        def _run_lstm_inference(batch):
-            return model_volume(batch, training=False).numpy()[0]
-
-        pred_scaled = await asyncio.to_thread(_run_lstm_inference, X_batch)
-        pred_volume_ton = (pred_scaled * float(scaler_scale[0])) + float(scaler_mean[0])
-        pred_volume_ton = np.maximum(pred_volume_ton, 0.0)
-
-        predictions = [
-            {"bulan_ke": i + 1, "volume_ton": round(float(v), 2)}
-            for i, v in enumerate(pred_volume_ton)
-        ]
+        timeline = predict_volume_lstm(tps_info["area_type"], 0.0)
+        forecasts = [p for p in timeline if p["type"] == "forecast"]
         
+        LBL12 = ["Jan","Feb","Mar","Apr","Mei","Jun","Jul","Agu","Sep","Okt","Nov","Des"]
+        now_dt = datetime.now()
+        history_12 = []
+        agg = DF_VOL_AGG.get(tps_info["area_type"])
+        if agg is not None:
+            actual = agg[
+                (agg['tahun'] < now_dt.year) |
+                ((agg['tahun'] == now_dt.year) & (agg['bulan'] <= now_dt.month))
+            ].tail(WINDOW_SIZE)
+            for _, row in actual.iterrows():
+                m, y = int(row['bulan']), int(row['tahun'])
+                history_12.append({
+                    "bulan": m, "tahun": y,
+                    "volume_ton": round(float(row['volume_ton']), 2),
+                    "label": f"{LBL12[m-1]} {y}",
+                })
+
         return {
             "status": "success", 
-            "tps": tps_info,
-            "predictions": predictions
+            "data": {
+                "tps": tps_info,
+                "history_12": history_12,
+                "predictions": forecasts
+            }
         }
-
     except Exception as e:
         import traceback
         traceback.print_exc()
